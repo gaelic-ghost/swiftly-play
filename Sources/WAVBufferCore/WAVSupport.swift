@@ -40,7 +40,7 @@ public struct WAVStreamFramer {
     public mutating func popNextFrame() throws -> Data? {
         let headerLength = 12
 
-        while storage.count >= 4, storage.prefix(4) != Data("RIFF".utf8) {
+        while storage.count >= 4, storage.slice(at: 0, length: 4) != Data("RIFF".utf8) {
             storage.removeFirst()
         }
 
@@ -48,7 +48,7 @@ public struct WAVStreamFramer {
             return nil
         }
 
-        guard storage[8..<12] == Data("WAVE".utf8) else {
+        guard storage.slice(at: 8, length: 4) == Data("WAVE".utf8) else {
             throw WAVStreamError.unsupportedContainer
         }
 
@@ -72,7 +72,9 @@ public struct ParsedWAV {
     public let pcmData: Data
 
     public init(data: Data) throws {
-        guard data.count >= 12, data.prefix(4) == Data("RIFF".utf8), data[8..<12] == Data("WAVE".utf8) else {
+        guard data.count >= 12,
+              data.slice(at: 0, length: 4) == Data("RIFF".utf8),
+              data.slice(at: 8, length: 4) == Data("WAVE".utf8) else {
             throw WAVStreamError.unsupportedContainer
         }
 
@@ -81,7 +83,7 @@ public struct ParsedWAV {
         var sampleData: Data?
 
         while cursor + 8 <= data.count {
-            let chunkID = data[cursor..<(cursor + 4)]
+            let chunkID = data.slice(at: cursor, length: 4)
             let chunkSize = Int(data.readUInt32LE(at: cursor + 4))
             let payloadStart = cursor + 8
             let paddedChunkSize = chunkSize + (chunkSize % 2)
@@ -93,9 +95,9 @@ public struct ParsedWAV {
             }
 
             if chunkID == Data("fmt ".utf8) {
-                fmtChunk = try WAVFormatChunk(data: data[payloadStart..<payloadEnd])
+                fmtChunk = try WAVFormatChunk(data: data.slice(at: payloadStart, length: chunkSize))
             } else if chunkID == Data("data".utf8) {
-                sampleData = Data(data[payloadStart..<payloadEnd])
+                sampleData = data.slice(at: payloadStart, length: chunkSize)
             }
 
             cursor = nextChunk
@@ -128,7 +130,7 @@ struct WAVFormatChunk {
     let blockAlign: UInt16
     let bitsPerSample: UInt16
 
-    init(data: Data.SubSequence) throws {
+    init(data: Data) throws {
         guard data.count >= 16 else {
             throw WAVStreamError.missingFormatChunk
         }
@@ -198,18 +200,32 @@ public struct WAVPCMFormat: Equatable, Sendable, CustomStringConvertible {
 
 // MARK: - Data Helpers
 
-private extension Data {
+private extension DataProtocol {
     func readUInt16LE(at offset: Int) -> UInt16 {
-        let lower = UInt16(self[offset])
-        let upper = UInt16(self[offset + 1]) << 8
+        let lowerIndex = index(startIndex, offsetBy: offset)
+        let upperIndex = index(lowerIndex, offsetBy: 1)
+        let lower = UInt16(self[lowerIndex])
+        let upper = UInt16(self[upperIndex]) << 8
         return lower | upper
     }
 
     func readUInt32LE(at offset: Int) -> UInt32 {
-        let b0 = UInt32(self[offset])
-        let b1 = UInt32(self[offset + 1]) << 8
-        let b2 = UInt32(self[offset + 2]) << 16
-        let b3 = UInt32(self[offset + 3]) << 24
+        let b0Index = index(startIndex, offsetBy: offset)
+        let b1Index = index(b0Index, offsetBy: 1)
+        let b2Index = index(b1Index, offsetBy: 1)
+        let b3Index = index(b2Index, offsetBy: 1)
+        let b0 = UInt32(self[b0Index])
+        let b1 = UInt32(self[b1Index]) << 8
+        let b2 = UInt32(self[b2Index]) << 16
+        let b3 = UInt32(self[b3Index]) << 24
         return b0 | b1 | b2 | b3
+    }
+}
+
+private extension Data {
+    func slice(at offset: Int, length: Int) -> Data {
+        let lowerBound = index(startIndex, offsetBy: offset)
+        let upperBound = index(lowerBound, offsetBy: length)
+        return self[lowerBound..<upperBound]
     }
 }
