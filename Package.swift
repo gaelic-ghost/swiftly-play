@@ -22,7 +22,7 @@ let package = Package(
         ),
         .testTarget(
             name: "wavbufferSmokeTests",
-            dependencies: []
+            dependencies: ["wavbuffer"]
         ),
     ]
 )
