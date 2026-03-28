@@ -26,8 +26,8 @@ final class WavBufferCommandTests: XCTestCase {
     func testAcceptsBufferPrerollWithoutSeconds() throws {
         XCTAssertNoThrow(
             try WavBufferCommand.parseAsRoot([
-                "--queue-depth", "4",
-                "--preroll-buffers", "2",
+                "--queue-depth", "8",
+                "--preroll-buffers", "3",
             ])
         )
     }

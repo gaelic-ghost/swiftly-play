@@ -12,7 +12,7 @@ trap 'rm -f "$normal_stderr" "$starved_stderr" "$starved_fifo"' EXIT HUP INT TER
 cd "$REPO_DIR"
 
 swift "$SCRIPT_DIR/generate_test_wav_stream.swift" \
-    | swift run wavbuffer --preroll-buffers 2 2>"$normal_stderr"
+    | swift run wavbuffer --queue-depth 8 --preroll-buffers 3 2>"$normal_stderr"
 
 grep -q 'event=engine_started' "$normal_stderr"
 grep -q 'event=playback_started' "$normal_stderr"

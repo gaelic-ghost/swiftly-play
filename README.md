@@ -20,16 +20,17 @@ swift run wavbuffer < stream.wavs
 Use preroll if you want the player to queue more than the first chunk before starting:
 
 ```sh
-swift run wavbuffer --preroll-buffers 2 < stream.wavs
+swift run wavbuffer --queue-depth 8 --preroll-buffers 3 < stream.wavs
 swift run wavbuffer --preroll-seconds 0.5 < stream.wavs
 ```
 
 The two preroll flags are mutually exclusive.
+For the current `speak-to-user` service on Gale's M4 Pro, the recommended `wavbuffer` path is `--queue-depth 8 --preroll-buffers 3` so playback waits for a few full buffers instead of starting after a single long chunk.
 
 For a local demo stream:
 
 ```sh
-sh scripts/e2e_wavbuffer.sh --preroll-buffers 2
+sh scripts/e2e_wavbuffer.sh --queue-depth 8 --preroll-buffers 3
 ```
 
 ## Stderr Vocabulary
