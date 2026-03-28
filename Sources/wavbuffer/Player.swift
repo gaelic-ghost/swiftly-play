@@ -64,9 +64,48 @@ enum PlaybackError: LocalizedError {
     }
 }
 
+enum StreamTerminationError: LocalizedError {
+    case starvationTimeout(format: String, timeoutSeconds: Double)
+    case streamFailed(reason: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .starvationTimeout(format, timeoutSeconds):
+            return "Playback waited \(WAVStreamer.formatDecimal(timeoutSeconds)) seconds for more audio and timed out for format \(format)."
+        case let .streamFailed(reason):
+            return "Generation stream failed: \(reason)"
+        }
+    }
+
+    var logDetails: String {
+        switch self {
+        case let .starvationTimeout(format, timeoutSeconds):
+            return [
+                "type=\"StreamTerminationError\"",
+                "reason=\"starvation_timeout\"",
+                "format=\"\(escape(format))\"",
+                "timeout_seconds=\(WAVStreamer.formatDecimal(timeoutSeconds))",
+                "description=\"\(escape(errorDescription ?? "Unknown stream termination error."))\"",
+            ].joined(separator: " ")
+        case let .streamFailed(reason):
+            return [
+                "type=\"StreamTerminationError\"",
+                "reason=\"stream_failed\"",
+                "failure_reason=\"\(escape(reason))\"",
+                "description=\"\(escape(errorDescription ?? "Unknown stream termination error."))\"",
+            ].joined(separator: " ")
+        }
+    }
+}
+
 // MARK: - Streamer
 
 final class WAVStreamer: @unchecked Sendable {
+    enum InputProtocol: Sendable {
+        case wav
+        case serviceV1
+    }
+
     enum Preroll: Equatable, Sendable {
         case none
         case buffers(Int)
@@ -95,23 +134,38 @@ final class WAVStreamer: @unchecked Sendable {
     private let queueSemaphore: DispatchSemaphore
     private let completionGroup = DispatchGroup()
     private let preroll: Preroll
+    private let inputProtocol: InputProtocol
     private let state = NSCondition()
     private let stderrLock = NSLock()
 
     private var activeFormat: AVAudioFormat?
     private var activeFormatDescription = "uninitialized"
+    private var expectedChunkCount: Int?
+    private var expectedSampleRate: Double?
+    private var expectedChannelCount: Int?
+    private var starvationTimeoutSeconds: Double
 
     private var pendingFrames: [Data] = []
     private var readerError: Error?
     private var inputFinished = false
     private var queuedBuffers = 0
     private var queuedSeconds = 0.0
-    private var playbackStarted = false
-    private var starvationError: PlaybackError?
+    private var isActivelyPlaying = false
+    private var playbackHasStarted = false
+    private var waitingForAudio = false
+    private var starvationDeadline: Date?
+    private var terminalFailure: StreamTerminationError?
 
-    init(queueDepth: Int, preroll: Preroll) {
+    init(
+        queueDepth: Int,
+        preroll: Preroll,
+        inputProtocol: InputProtocol,
+        starvationTimeoutSeconds: Double
+    ) {
         queueSemaphore = DispatchSemaphore(value: queueDepth)
         self.preroll = preroll
+        self.inputProtocol = inputProtocol
+        self.starvationTimeoutSeconds = starvationTimeoutSeconds
         engine.attach(player)
     }
 
@@ -130,11 +184,12 @@ final class WAVStreamer: @unchecked Sendable {
 
         startPlaybackIfNeeded(force: true, reason: "input_completed")
 
-        if let starvationError {
-            throw starvationError
+        completionGroup.wait()
+
+        if let terminalFailure {
+            throw terminalFailure
         }
 
-        completionGroup.wait()
         emitEvent("completed", extraFields: preroll.eventFields)
     }
 
@@ -147,6 +202,15 @@ final class WAVStreamer: @unchecked Sendable {
     }
 
     private func readStandardInput() {
+        switch inputProtocol {
+        case .wav:
+            readStandardInputAsWAVChunks()
+        case .serviceV1:
+            readStandardInputAsServiceFrames()
+        }
+    }
+
+    private func readStandardInputAsWAVChunks() {
         var framer = WAVStreamFramer()
         let stdin = FileHandle.standardInput
 
@@ -183,20 +247,113 @@ final class WAVStreamer: @unchecked Sendable {
         }
     }
 
+    private func readStandardInputAsServiceFrames() {
+        var framer = ServiceStreamFramer()
+        let stdin = FileHandle.standardInput
+
+        do {
+            while true {
+                let chunk = stdin.availableData
+                guard !chunk.isEmpty else {
+                    break
+                }
+
+                framer.append(chunk)
+
+                while let record = try framer.popNextRecord() {
+                    try handleServiceRecord(record)
+                }
+            }
+
+            if !framer.isEmpty {
+                throw ServiceStreamError.invalidControlPayload
+            }
+
+            state.lock()
+            if !inputFinished {
+                inputFinished = true
+            }
+            state.broadcast()
+            state.unlock()
+        } catch {
+            state.lock()
+            readerError = error
+            state.broadcast()
+            state.unlock()
+        }
+    }
+
+    private func handleServiceRecord(_ record: ServiceStreamRecord) throws {
+        switch record {
+        case let .config(config):
+            state.lock()
+            if let timeoutSeconds = config.starvationTimeoutSeconds, timeoutSeconds > 0 {
+                starvationTimeoutSeconds = timeoutSeconds
+            }
+            expectedChunkCount = config.expectedChunkCount
+            expectedSampleRate = config.expectedSampleRate
+            expectedChannelCount = config.expectedChannelCount
+            state.broadcast()
+            state.unlock()
+            var fields = ["protocol_version=\(config.protocolVersion)"]
+            if let timeoutSeconds = config.starvationTimeoutSeconds {
+                fields.append("starvation_timeout_seconds=\(Self.formatDecimal(timeoutSeconds))")
+            }
+            if let expectedChunkCount = config.expectedChunkCount {
+                fields.append("expected_chunk_count=\(expectedChunkCount)")
+            }
+            if let expectedSampleRate = config.expectedSampleRate {
+                fields.append("expected_sample_rate=\(Self.formatDecimal(expectedSampleRate))")
+            }
+            if let expectedChannelCount = config.expectedChannelCount {
+                fields.append("expected_channel_count=\(expectedChannelCount)")
+            }
+            emitEvent("stream_config_received", extraFields: fields)
+        case let .audioChunk(wavData):
+            state.lock()
+            pendingFrames.append(wavData)
+            state.signal()
+            state.unlock()
+        case .end:
+            state.lock()
+            inputFinished = true
+            state.broadcast()
+            state.unlock()
+            emitEvent("stream_end_received", extraFields: [])
+        case let .failed(reason):
+            state.lock()
+            terminalFailure = .streamFailed(reason: reason)
+            inputFinished = true
+            state.broadcast()
+            state.unlock()
+            emitEvent("stream_failed", extraFields: ["reason=\"\(escape(reason))\""])
+        }
+    }
+
     private func nextFrame() throws -> Data? {
         state.lock()
         defer { state.unlock() }
 
-        while pendingFrames.isEmpty, readerError == nil, starvationError == nil, !inputFinished {
+        while pendingFrames.isEmpty, readerError == nil, !inputFinished {
+            if waitingForAudio {
+                let deadline = starvationDeadline ?? Date().addingTimeInterval(starvationTimeoutSeconds)
+                starvationDeadline = deadline
+                if !state.wait(until: deadline), pendingFrames.isEmpty, readerError == nil, !inputFinished {
+                    terminalFailure = .starvationTimeout(
+                        format: activeFormatDescription,
+                        timeoutSeconds: starvationTimeoutSeconds
+                    )
+                    inputFinished = true
+                    state.broadcast()
+                    break
+                }
+                continue
+            }
             state.wait()
         }
 
         if let readerError {
             throw readerError
-        }
-
-        if let starvationError {
-            throw starvationError
         }
 
         if pendingFrames.isEmpty {
@@ -216,6 +373,20 @@ final class WAVStreamer: @unchecked Sendable {
         guard playbackFormat.isEqual(parsedFormat) else {
             throw PlaybackError.inconsistentFormat(
                 expected: describe(playbackFormat),
+                got: describe(parsedFormat)
+            )
+        }
+
+        if let expectedSampleRate, parsedFormat.sampleRate != expectedSampleRate {
+            throw PlaybackError.inconsistentFormat(
+                expected: "service-config sampleRate=\(expectedSampleRate)",
+                got: describe(parsedFormat)
+            )
+        }
+
+        if let expectedChannelCount, Int(parsedFormat.channelCount) != expectedChannelCount {
+            throw PlaybackError.inconsistentFormat(
+                expected: "service-config channels=\(expectedChannelCount)",
                 got: describe(parsedFormat)
             )
         }
@@ -265,7 +436,7 @@ final class WAVStreamer: @unchecked Sendable {
         state.lock()
         defer { state.unlock() }
 
-        guard !playbackStarted else {
+        guard !isActivelyPlaying else {
             return
         }
 
@@ -278,7 +449,9 @@ final class WAVStreamer: @unchecked Sendable {
         }
 
         player.play()
-        playbackStarted = true
+        isActivelyPlaying = true
+        waitingForAudio = false
+        starvationDeadline = nil
 
         let fields = [
             "buffered_buffers=\(queuedBuffers)",
@@ -286,7 +459,12 @@ final class WAVStreamer: @unchecked Sendable {
             "reason=\"\(force ? "forced_\(reason)" : reason)\"",
             "format=\"\(escape(activeFormatDescription))\"",
         ] + preroll.eventFields
-        emitEvent("playback_started", extraFields: fields)
+        if playbackHasStarted {
+            emitEvent("playback_resumed", extraFields: fields)
+        } else {
+            playbackHasStarted = true
+            emitEvent("playback_started", extraFields: fields)
+        }
     }
 
     private var prerollSatisfied: Bool {
@@ -294,7 +472,17 @@ final class WAVStreamer: @unchecked Sendable {
         case .none:
             return queuedBuffers > 0
         case let .buffers(count):
-            return queuedBuffers >= count
+            let effectiveCount: Int
+            if let expectedChunkCount {
+                if expectedChunkCount <= 2 {
+                    effectiveCount = min(count, max(1, expectedChunkCount))
+                } else {
+                    effectiveCount = min(count, 2, expectedChunkCount)
+                }
+            } else {
+                effectiveCount = count
+            }
+            return queuedBuffers >= effectiveCount
         case let .seconds(seconds):
             return queuedSeconds >= seconds
         }
@@ -310,8 +498,10 @@ final class WAVStreamer: @unchecked Sendable {
         queuedBuffers = max(0, queuedBuffers - 1)
         queuedSeconds = max(0, queuedSeconds - duration)
 
-        if playbackStarted, queuedBuffers == 0, !inputFinished, starvationError == nil {
-            starvationError = .streamStarved(format: activeFormatDescription)
+        if isActivelyPlaying, queuedBuffers == 0, !inputFinished, terminalFailure == nil {
+            isActivelyPlaying = false
+            waitingForAudio = true
+            starvationDeadline = Date().addingTimeInterval(starvationTimeoutSeconds)
             emittedUnderrun = true
         }
 
@@ -324,6 +514,13 @@ final class WAVStreamer: @unchecked Sendable {
                 extraFields: [
                     "buffered_buffers=0",
                     "buffered_seconds=\(Self.formatDecimal(0))",
+                    "format=\"\(escape(activeFormatDescription))\"",
+                ] + preroll.eventFields
+            )
+            emitEvent(
+                "waiting_for_audio",
+                extraFields: [
+                    "timeout_seconds=\(Self.formatDecimal(starvationTimeoutSeconds))",
                     "format=\"\(escape(activeFormatDescription))\"",
                 ] + preroll.eventFields
             )

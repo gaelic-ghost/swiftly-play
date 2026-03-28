@@ -37,9 +37,7 @@ writer_pid=$!
 
 if swift run wavbuffer <"$starved_fifo" 2>"$starved_stderr"
 then
-    wait "$writer_pid" || true
-    echo "Expected starvation run to fail, but it succeeded." >&2
-    exit 1
+    :
 fi
 
 wait "$writer_pid" || true
@@ -47,4 +45,6 @@ wait "$writer_pid" || true
 grep -q 'event=engine_started' "$starved_stderr"
 grep -q 'event=playback_started' "$starved_stderr"
 grep -q 'event=underrun' "$starved_stderr"
-grep -q 'event=error .*reason="stream_starved"' "$starved_stderr"
+grep -q 'event=waiting_for_audio' "$starved_stderr"
+grep -q 'event=playback_resumed' "$starved_stderr"
+grep -q 'event=completed' "$starved_stderr"

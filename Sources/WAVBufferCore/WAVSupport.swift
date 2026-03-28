@@ -200,7 +200,7 @@ public struct WAVPCMFormat: Equatable, Sendable, CustomStringConvertible {
 
 // MARK: - Data Helpers
 
-private extension DataProtocol {
+extension DataProtocol {
     func readUInt16LE(at offset: Int) -> UInt16 {
         let lowerIndex = index(startIndex, offsetBy: offset)
         let upperIndex = index(lowerIndex, offsetBy: 1)
@@ -222,7 +222,7 @@ private extension DataProtocol {
     }
 }
 
-private extension Data {
+extension Data {
     func slice(at offset: Int, length: Int) -> Data {
         let lowerBound = index(startIndex, offsetBy: offset)
         let upperBound = index(lowerBound, offsetBy: length)

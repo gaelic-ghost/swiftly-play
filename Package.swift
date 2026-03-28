@@ -24,5 +24,12 @@ let package = Package(
             name: "wavbufferSmokeTests",
             dependencies: ["wavbuffer"]
         ),
+        .testTarget(
+            name: "wavbufferTests",
+            dependencies: [
+                "WAVBufferCore",
+                "wavbuffer",
+            ]
+        ),
     ]
 )

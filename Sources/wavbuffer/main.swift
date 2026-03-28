@@ -12,6 +12,9 @@ private enum StderrOutput {
         if let playbackError = error as? PlaybackError, let details = playbackError.logDetails {
             return details
         }
+        if let streamTerminationError = error as? StreamTerminationError {
+            return streamTerminationError.logDetails
+        }
 
         let nsError = error as NSError
         var fields = [
@@ -49,6 +52,11 @@ private enum StderrOutput {
 }
 
 struct WavBufferCommand: ParsableCommand {
+    enum InputProtocol: String, ExpressibleByArgument {
+        case wav
+        case serviceV1 = "service-v1"
+    }
+
     static let configuration = CommandConfiguration(
         commandName: "wavbuffer",
         abstract: "Play a streaming stdin feed of concatenated WAV buffers with AVAudioEngine."
@@ -72,6 +80,18 @@ struct WavBufferCommand: ParsableCommand {
     )
     var prerollSeconds: Double?
 
+    @Option(
+        name: .long,
+        help: "Input protocol on stdin: concatenated WAV chunks or the service control stream."
+    )
+    var inputProtocol: InputProtocol = .wav
+
+    @Option(
+        name: .long,
+        help: "When playback starves, keep the process alive and wait this many seconds for more chunks before failing."
+    )
+    var starvationTimeoutSeconds = 45.0
+
     mutating func validate() throws {
         guard queueDepth > 0 else {
             throw ValidationError("--queue-depth must be greater than zero.")
@@ -83,6 +103,10 @@ struct WavBufferCommand: ParsableCommand {
 
         if let prerollSeconds, prerollSeconds <= 0 {
             throw ValidationError("--preroll-seconds must be greater than zero.")
+        }
+
+        guard starvationTimeoutSeconds > 0 else {
+            throw ValidationError("--starvation-timeout-seconds must be greater than zero.")
         }
 
         if prerollBuffers != nil, prerollSeconds != nil {
@@ -97,7 +121,9 @@ struct WavBufferCommand: ParsableCommand {
 
         let streamer = WAVStreamer(
             queueDepth: queueDepth,
-            preroll: prerollConfiguration
+            preroll: prerollConfiguration,
+            inputProtocol: streamerInputProtocol,
+            starvationTimeoutSeconds: starvationTimeoutSeconds
         )
         // Apple documents that connected node formats must match, so the first WAV
         // chunk establishes the stream format and later chunks are validated against it.
@@ -119,6 +145,15 @@ struct WavBufferCommand: ParsableCommand {
         }
 
         return .none
+    }
+
+    private var streamerInputProtocol: WAVStreamer.InputProtocol {
+        switch inputProtocol {
+        case .wav:
+            return .wav
+        case .serviceV1:
+            return .serviceV1
+        }
     }
 }
 

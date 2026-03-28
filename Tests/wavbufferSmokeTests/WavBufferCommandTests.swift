@@ -40,4 +40,13 @@ final class WavBufferCommandTests: XCTestCase {
             ])
         )
     }
+
+    func testAcceptsServiceInputProtocol() throws {
+        XCTAssertNoThrow(
+            try WavBufferCommand.parseAsRoot([
+                "--input-protocol", "service-v1",
+                "--starvation-timeout-seconds", "45",
+            ])
+        )
+    }
 }
